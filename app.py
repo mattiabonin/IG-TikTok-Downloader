@@ -17,19 +17,21 @@ e la salva con "Save to Photo Album".
 """
 
 from flask import Flask, request, jsonify
-import yt_dlp
+import instaloader
 import requests
 import os
 import base64
 import tempfile
+import re
+from http.cookiejar import MozillaCookieJar
 
 app = Flask(__name__)
 
 TIKWM_ENDPOINT = "https://www.tikwm.com/api/"
 
-# Instagram spesso rifiuta di servire i formati video a richieste anonime
-# provenienti da IP di datacenter (come quelli di Render). La soluzione è
-# passare a yt-dlp i cookie di una sessione Instagram autenticata.
+# Instagram spesso rifiuta di servire i media a richieste anonime provenienti
+# da IP di datacenter (come quelli di Render). La soluzione è passare a
+# instaloader i cookie di una sessione Instagram autenticata.
 #
 # Su Render, imposta una variabile d'ambiente IG_COOKIES_B64 con il contenuto
 # di un file cookies.txt (formato Netscape) codificato in base64. Vedi GUIDA.md
@@ -45,6 +47,38 @@ if _cookies_b64:
         COOKIES_FILE_PATH = tmp.name
     except Exception as e:
         print(f"Impossibile decodificare IG_COOKIES_B64: {e}")
+
+SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|tv)/([^/?#&]+)")
+
+
+def _build_instaloader_context() -> instaloader.Instaloader:
+    """Crea un contesto instaloader, autenticato con i cookie se disponibili."""
+    L = instaloader.Instaloader(
+        quiet=True,
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+    )
+    if COOKIES_FILE_PATH:
+        cj = MozillaCookieJar(COOKIES_FILE_PATH)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        L.context._session.cookies.update(cj)
+        csrf_token = None
+        username = None
+        for cookie in cj:
+            if cookie.name == "csrftoken":
+                csrf_token = cookie.value
+            if cookie.name == "ds_user_id":
+                username = cookie.value
+        if csrf_token:
+            L.context._session.headers.update({"X-CSRFToken": csrf_token})
+        if username:
+            L.context.username = username
+    return L
 
 
 def extract_tiktok(url: str) -> dict:
@@ -69,85 +103,62 @@ def extract_tiktok(url: str) -> dict:
 
 
 def extract_instagram(url: str) -> dict:
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
-    if COOKIES_FILE_PATH:
-        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    match = SHORTCODE_RE.search(url)
+    if not match:
+        raise ValueError("URL Instagram non riconosciuto (atteso un link a /p/, /reel/ o /tv/)")
+    shortcode = match.group(1)
 
-    # Un post con più elementi (carosello) arriva come playlist di "entries"
-    entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+    L = _build_instaloader_context()
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
 
     media = []
-    for entry in entries:
-        if not entry:
-            continue
-        is_video = entry.get("ext") in ("mp4", "mov") or (
-            entry.get("vcodec") and entry.get("vcodec") != "none"
-        )
-        direct_url = entry.get("url")
-        if not direct_url and entry.get("formats"):
-            direct_url = entry["formats"][-1].get("url")
-        if not direct_url:
-            continue
-        media.append({"type": "video" if is_video else "image", "url": direct_url})
+    if post.typename == "GraphSidecar":
+        for node in post.get_sidecar_nodes():
+            if node.is_video:
+                media.append({"type": "video", "url": node.video_url})
+            else:
+                media.append({"type": "image", "url": node.display_url})
+    elif post.is_video:
+        media.append({"type": "video", "url": post.video_url})
+    else:
+        media.append({"type": "image", "url": post.url})
 
     if not media:
-        raise ValueError("Nessun media estraibile dal post (privato o URL non valido)")
+        raise ValueError("Nessun media estraibile dal post (privato, rimosso o URL non valido)")
 
     post_type = "carousel" if len(media) > 1 else media[0]["type"]
     return {"platform": "instagram", "type": post_type, "media": media}
 
 
-class _LogCapture:
-    def __init__(self):
-        self.lines = []
-
-    def debug(self, msg):
-        self.lines.append(f"DEBUG: {msg}")
-
-    def info(self, msg):
-        self.lines.append(f"INFO: {msg}")
-
-    def warning(self, msg):
-        self.lines.append(f"WARNING: {msg}")
-
-    def error(self, msg):
-        self.lines.append(f"ERROR: {msg}")
-
-
 @app.route("/debug-extract")
 def debug_extract():
-    """Endpoint temporaneo: prova un'estrazione Instagram catturando i log interni di yt-dlp."""
+    """Endpoint temporaneo: prova un'estrazione Instagram e mostra diagnostica dettagliata."""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"error": "parametro 'url' mancante, es. ?url=https://www.instagram.com/p/XXX/"}), 400
 
-    logcap = _LogCapture()
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": False,
-        "skip_download": True,
-        "verbose": True,
-        "logger": logcap,
-    }
-    if COOKIES_FILE_PATH:
-        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
-
     result = {"cookies_used": COOKIES_FILE_PATH is not None}
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        match = SHORTCODE_RE.search(url)
+        if not match:
+            result["success"] = False
+            result["exception"] = "shortcode non trovato nell'URL"
+            return jsonify(result)
+        shortcode = match.group(1)
+        result["shortcode"] = shortcode
+
+        L = _build_instaloader_context()
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        result["typename"] = post.typename
+        result["is_video"] = post.is_video
+        if post.typename == "GraphSidecar":
+            nodes = list(post.get_sidecar_nodes())
+            result["sidecar_count"] = len(nodes)
+            result["sidecar_types"] = ["video" if n.is_video else "image" for n in nodes]
         result["success"] = True
-        result["keys_found"] = list(info.keys()) if info else []
     except Exception as e:
         result["success"] = False
-        result["exception"] = str(e)
-    result["log"] = logcap.lines[-40:]  # ultime 40 righe, per non appesantire troppo
+        result["exception"] = f"{type(e).__name__}: {e}"
     return jsonify(result)
 
 
