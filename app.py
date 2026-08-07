@@ -16,13 +16,14 @@ Shortcuts scarica poi ogni "url" della lista con "Get Contents of URL"
 e la salva con "Save to Photo Album".
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import instaloader
 import requests
 import os
 import base64
 import tempfile
 import re
+from urllib.parse import quote
 from http.cookiejar import MozillaCookieJar
 
 app = Flask(__name__)
@@ -67,13 +68,9 @@ def _build_instaloader_context() -> instaloader.Instaloader:
         cj = MozillaCookieJar(COOKIES_FILE_PATH)
         cj.load(ignore_discard=True, ignore_expires=True)
         L.context._session.cookies.update(cj)
-        csrf_token = None
-        username = None
-        for cookie in cj:
-            if cookie.name == "csrftoken":
-                csrf_token = cookie.value
-            if cookie.name == "ds_user_id":
-                username = cookie.value
+        cookie_dict = {c.name: c.value for c in cj}
+        csrf_token = cookie_dict.get("csrftoken")
+        username = cookie_dict.get("ds_user_id")
         if csrf_token:
             L.context._session.headers.update({"X-CSRFToken": csrf_token})
         if username:
@@ -162,6 +159,49 @@ def debug_extract():
     return jsonify(result)
 
 
+def _load_cookie_dict() -> dict:
+    if not COOKIES_FILE_PATH:
+        return {}
+    cj = MozillaCookieJar(COOKIES_FILE_PATH)
+    cj.load(ignore_discard=True, ignore_expires=True)
+    return {c.name: c.value for c in cj}
+
+
+@app.route("/proxy")
+def proxy():
+    """Scarica un media (immagine/video) usando gli header/cookie giusti lato
+    server, e lo ripassa a chi chiama. Serve perché il CDN di Instagram a
+    volte restituisce contenuto vuoto/placeholder a richieste anonime dirette
+    (es. da Shortcuts), mentre risponde correttamente a richieste che portano
+    la sessione autenticata."""
+    target = request.args.get("url", "").strip()
+    if not target:
+        return jsonify({"error": "parametro 'url' mancante"}), 400
+
+    is_instagram = "cdninstagram.com" in target or "fbcdn.net" in target
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+    }
+    cookies = {}
+    if is_instagram:
+        headers["Referer"] = "https://www.instagram.com/"
+        cookies = _load_cookie_dict()
+    else:
+        headers["Referer"] = "https://www.tiktok.com/"
+
+    try:
+        r = requests.get(target, headers=headers, cookies=cookies, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": f"proxy fetch fallito: {e}"}), 502
+
+    content_type = r.headers.get("Content-Type", "application/octet-stream")
+    return Response(r.content, content_type=content_type)
+
+
 @app.route("/extract")
 def extract():
     url = request.args.get("url", "").strip()
@@ -175,6 +215,13 @@ def extract():
             result = extract_instagram(url)
         else:
             return jsonify({"error": "piattaforma non supportata (solo Instagram/TikTok)"}), 400
+
+        # Riscriviamo ogni link per passare dal nostro /proxy invece che dal
+        # CDN diretto, così chi scarica (es. Shortcuts) ottiene sempre i byte
+        # corretti indipendentemente da header/cookie che non può impostare.
+        for item in result.get("media", []):
+            item["url"] = f"{request.host_url}proxy?url={quote(item['url'], safe='')}"
+
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
