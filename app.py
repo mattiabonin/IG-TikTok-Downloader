@@ -19,10 +19,32 @@ e la salva con "Save to Photo Album".
 from flask import Flask, request, jsonify
 import yt_dlp
 import requests
+import os
+import base64
+import tempfile
 
 app = Flask(__name__)
 
 TIKWM_ENDPOINT = "https://www.tikwm.com/api/"
+
+# Instagram spesso rifiuta di servire i formati video a richieste anonime
+# provenienti da IP di datacenter (come quelli di Render). La soluzione è
+# passare a yt-dlp i cookie di una sessione Instagram autenticata.
+#
+# Su Render, imposta una variabile d'ambiente IG_COOKIES_B64 con il contenuto
+# di un file cookies.txt (formato Netscape) codificato in base64. Vedi GUIDA.md
+# per come esportarlo dal browser.
+COOKIES_FILE_PATH = None
+_cookies_b64 = os.environ.get("IG_COOKIES_B64")
+if _cookies_b64:
+    try:
+        cookies_content = base64.b64decode(_cookies_b64).decode("utf-8")
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        tmp.write(cookies_content)
+        tmp.close()
+        COOKIES_FILE_PATH = tmp.name
+    except Exception as e:
+        print(f"Impossibile decodificare IG_COOKIES_B64: {e}")
 
 
 def extract_tiktok(url: str) -> dict:
@@ -52,6 +74,8 @@ def extract_instagram(url: str) -> dict:
         "no_warnings": True,
         "skip_download": True,
     }
+    if COOKIES_FILE_PATH:
+        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
