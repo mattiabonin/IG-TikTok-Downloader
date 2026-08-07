@@ -123,7 +123,36 @@ def extract():
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "cookies_loaded": COOKIES_FILE_PATH is not None,
+    })
+
+
+@app.route("/debug-cookies")
+def debug_cookies():
+    """Endpoint temporaneo per diagnosticare problemi con i cookie Instagram."""
+    if not COOKIES_FILE_PATH:
+        return jsonify({"cookies_loaded": False, "reason": "IG_COOKIES_B64 non impostata o decodifica fallita"})
+    try:
+        with open(COOKIES_FILE_PATH, "r") as f:
+            content = f.read()
+        lines = content.splitlines()
+        non_comment_lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+        domains = set()
+        for l in non_comment_lines:
+            parts = l.split("\t")
+            if parts:
+                domains.add(parts[0])
+        return jsonify({
+            "cookies_loaded": True,
+            "total_lines": len(lines),
+            "cookie_entries": len(non_comment_lines),
+            "domains_found": list(domains)[:10],
+            "starts_with_netscape_header": content.startswith("# Netscape") or content.startswith("# HTTP Cookie"),
+        })
+    except Exception as e:
+        return jsonify({"cookies_loaded": True, "error_reading": str(e)})
 
 
 if __name__ == "__main__":
