@@ -103,6 +103,54 @@ def extract_instagram(url: str) -> dict:
     return {"platform": "instagram", "type": post_type, "media": media}
 
 
+class _LogCapture:
+    def __init__(self):
+        self.lines = []
+
+    def debug(self, msg):
+        self.lines.append(f"DEBUG: {msg}")
+
+    def info(self, msg):
+        self.lines.append(f"INFO: {msg}")
+
+    def warning(self, msg):
+        self.lines.append(f"WARNING: {msg}")
+
+    def error(self, msg):
+        self.lines.append(f"ERROR: {msg}")
+
+
+@app.route("/debug-extract")
+def debug_extract():
+    """Endpoint temporaneo: prova un'estrazione Instagram catturando i log interni di yt-dlp."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "parametro 'url' mancante, es. ?url=https://www.instagram.com/p/XXX/"}), 400
+
+    logcap = _LogCapture()
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": False,
+        "skip_download": True,
+        "verbose": True,
+        "logger": logcap,
+    }
+    if COOKIES_FILE_PATH:
+        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
+
+    result = {"cookies_used": COOKIES_FILE_PATH is not None}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        result["success"] = True
+        result["keys_found"] = list(info.keys()) if info else []
+    except Exception as e:
+        result["success"] = False
+        result["exception"] = str(e)
+    result["log"] = logcap.lines[-40:]  # ultime 40 righe, per non appesantire troppo
+    return jsonify(result)
+
+
 @app.route("/extract")
 def extract():
     url = request.args.get("url", "").strip()
