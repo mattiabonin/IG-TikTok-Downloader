@@ -63,6 +63,12 @@ def _build_instaloader_context() -> instaloader.Instaloader:
         download_comments=False,
         save_metadata=False,
         compress_json=False,
+        # Se la sessione non è valida, Instagram risponde "login_required" e
+        # instaloader di default ritenta all'infinito con backoff crescente,
+        # bloccando la richiesta finché il server non va in timeout. Con
+        # questi due parametri falliamo rapidamente invece di restare bloccati.
+        max_connection_attempts=1,
+        request_timeout=15,
     )
     if COOKIES_FILE_PATH:
         cj = MozillaCookieJar(COOKIES_FILE_PATH)
@@ -106,19 +112,27 @@ def extract_instagram(url: str) -> dict:
     shortcode = match.group(1)
 
     L = _build_instaloader_context()
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
 
-    media = []
-    if post.typename == "GraphSidecar":
-        for node in post.get_sidecar_nodes():
-            if node.is_video:
-                media.append({"type": "video", "url": node.video_url})
-            else:
-                media.append({"type": "image", "url": node.display_url})
-    elif post.is_video:
-        media.append({"type": "video", "url": post.video_url})
-    else:
-        media.append({"type": "image", "url": post.url})
+        media = []
+        if post.typename == "GraphSidecar":
+            for node in post.get_sidecar_nodes():
+                if node.is_video:
+                    media.append({"type": "video", "url": node.video_url})
+                else:
+                    media.append({"type": "image", "url": node.display_url})
+        elif post.is_video:
+            media.append({"type": "video", "url": post.video_url})
+        else:
+            media.append({"type": "image", "url": post.url})
+    except instaloader.exceptions.LoginRequiredException:
+        raise ValueError(
+            "Sessione Instagram scaduta o non valida: serve ri-esportare i "
+            "cookie (vedi sezione 4 della GUIDA.md) e aggiornare IG_COOKIES_B64 su Render."
+        )
+    except instaloader.exceptions.ConnectionException as e:
+        raise ValueError(f"Instagram ha rifiutato/bloccato la richiesta: {e}")
 
     if not media:
         raise ValueError("Nessun media estraibile dal post (privato, rimosso o URL non valido)")
