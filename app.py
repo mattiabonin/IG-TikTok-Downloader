@@ -29,6 +29,13 @@ from http.cookiejar import MozillaCookieJar
 app = Flask(__name__)
 
 TIKWM_ENDPOINT = "https://www.tikwm.com/api/"
+TIKWM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Referer": "https://www.tikwm.com/",
+}
 
 # Instagram spesso rifiuta di servire i media a richieste anonime provenienti
 # da IP di datacenter (come quelli di Render). La soluzione è passare a
@@ -85,8 +92,14 @@ def _build_instaloader_context() -> instaloader.Instaloader:
 
 
 def extract_tiktok(url: str) -> dict:
-    r = requests.get(TIKWM_ENDPOINT, params={"url": url}, timeout=20)
-    r.raise_for_status()
+    try:
+        r = requests.get(TIKWM_ENDPOINT, params={"url": url}, headers=TIKWM_HEADERS, timeout=20)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        raise ValueError(
+            f"Il servizio TikTok esterno ha rifiutato la richiesta ({e}). "
+            "Può essere un blocco temporaneo per troppe richieste: riprova tra qualche minuto."
+        )
     payload = r.json()
     data = payload.get("data") or {}
 
