@@ -18,6 +18,7 @@ e la salva con "Save to Photo Album".
 
 from flask import Flask, request, jsonify, Response
 import instaloader
+import yt_dlp
 import requests
 import os
 import base64
@@ -104,16 +105,43 @@ def _resolve_short_url(url: str) -> str:
         return url  # se la risoluzione fallisce, proviamo comunque con l'originale
 
 
+def _extract_tiktok_via_ytdlp(url: str) -> dict:
+    """Fallback quando tikwm è bloccato: usa yt-dlp per contattare
+    direttamente TikTok. Funziona solo per video singoli, NON per
+    caroselli fotografici (limite noto di yt-dlp su TikTok)."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if info.get("_type") == "playlist":
+        # Caroselli/slideshow: yt-dlp non li gestisce bene su TikTok
+        raise ValueError(
+            "Il servizio principale (tikwm) è momentaneamente bloccato e il "
+            "sistema di riserva non supporta i caroselli fotografici TikTok, "
+            "solo i video singoli. Riprova più tardi."
+        )
+
+    direct_url = info.get("url")
+    if not direct_url and info.get("formats"):
+        direct_url = info["formats"][-1].get("url")
+    if not direct_url:
+        raise ValueError("Nessun video estraibile con il sistema di riserva")
+
+    return {"platform": "tiktok", "type": "video", "media": [{"type": "video", "url": direct_url}]}
+
+
 def extract_tiktok(url: str) -> dict:
     url = _resolve_short_url(url)
     try:
         r = requests.get(TIKWM_ENDPOINT, params={"url": url}, headers=TIKWM_HEADERS, timeout=20)
         r.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        raise ValueError(
-            f"Il servizio TikTok esterno ha rifiutato la richiesta ({e}). "
-            "Può essere un blocco temporaneo per troppe richieste: riprova tra qualche minuto."
-        )
+    except requests.exceptions.HTTPError:
+        # tikwm bloccato (es. da Cloudflare): proviamo con yt-dlp come riserva
+        return _extract_tiktok_via_ytdlp(url)
     payload = r.json()
     data = payload.get("data") or {}
 
