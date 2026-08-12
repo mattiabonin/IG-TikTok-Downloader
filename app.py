@@ -71,10 +71,6 @@ def _build_instaloader_context() -> instaloader.Instaloader:
         download_comments=False,
         save_metadata=False,
         compress_json=False,
-        # Se la sessione non è valida, Instagram risponde "login_required" e
-        # instaloader di default ritenta all'infinito con backoff crescente,
-        # bloccando la richiesta finché il server non va in timeout. Con
-        # questi due parametri falliamo rapidamente invece di restare bloccati.
         max_connection_attempts=1,
         request_timeout=15,
     )
@@ -102,13 +98,13 @@ def _resolve_short_url(url: str) -> str:
         r = requests.get(url, headers=TIKWM_HEADERS, timeout=10, allow_redirects=True)
         return r.url
     except Exception:
-        return url  # se la risoluzione fallisce, proviamo comunque con l'originale
+        return url
 
 
 def _extract_tiktok_via_ytdlp(url: str) -> dict:
     """Fallback quando tikwm è bloccato: usa yt-dlp per contattare
     direttamente TikTok. Funziona solo per video singoli, NON per
-    caroselli fotografici (yt-dlp non supporta affatto le URL /photo/ di TikTok)."""
+    caroselli fotografici."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -143,7 +139,6 @@ def extract_tiktok(url: str) -> dict:
         r = requests.get(TIKWM_ENDPOINT, params={"url": url}, headers=TIKWM_HEADERS, timeout=20)
         r.raise_for_status()
     except requests.exceptions.HTTPError:
-        # tikwm bloccato (es. da Cloudflare): proviamo con yt-dlp come riserva
         return _extract_tiktok_via_ytdlp(url)
     payload = r.json()
     data = payload.get("data") or {}
@@ -267,10 +262,7 @@ def _load_cookie_dict() -> dict:
 @app.route("/proxy")
 def proxy():
     """Scarica un media (immagine/video) usando gli header/cookie giusti lato
-    server, e lo ripassa a chi chiama. Serve perché il CDN di Instagram a
-    volte restituisce contenuto vuoto/placeholder a richieste anonime dirette
-    (es. da Shortcuts), mentre risponde correttamente a richieste che portano
-    la sessione autenticata."""
+    server, e lo ripassa a chi chiama."""
     target = request.args.get("url", "").strip()
     if not target:
         return jsonify({"error": "parametro 'url' mancante"}), 400
@@ -301,11 +293,8 @@ def proxy():
 
 @app.route("/extract-simple")
 def extract_simple():
-    """Versione semplificata di /extract per Comandi Rapidi: invece di un
-    oggetto con "media": [{"type":..., "url":...}], restituisce DIRETTAMENTE
-    un elenco piatto di link pronti da scaricare (solo stringhe). Questo
-    evita che lo Shortcut debba estrarre chiavi da dizionari annidati dentro
-    il ciclo, che è il punto dove si creano più errori di collegamento."""
+    """Versione semplificata: restituisce direttamente un elenco piatto di
+    link pronti da scaricare (solo stringhe), invece di un oggetto annidato."""
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"error": "parametro 'url' mancante"}), 400
@@ -341,11 +330,6 @@ def extract():
         else:
             return jsonify({"error": "piattaforma non supportata (solo Instagram/TikTok)"}), 400
 
-        # Il /proxy serve per Instagram (serve la sessione autenticata per
-        # ottenere i byte corretti). I link TikTok, specialmente quelli
-        # firmati direttamente dai server ufficiali (quando usiamo yt-dlp
-        # come riserva), sono legati a header/contesto specifici e si rompono
-        # se passano da un proxy con header generici: li lasciamo diretti.
         if result.get("platform") == "instagram":
             for item in result.get("media", []):
                 item["url"] = f"{request.host_url}proxy?url={quote(item['url'], safe='')}"
