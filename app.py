@@ -91,7 +91,21 @@ def _build_instaloader_context() -> instaloader.Instaloader:
     return L
 
 
+def _resolve_short_url(url: str) -> str:
+    """I link corti tipo vm.tiktok.com/XXX reindirizzano internamente
+    all'URL completo. Lo risolviamo noi lato server prima di passarlo
+    all'API esterna, nel caso quest'ultima gestisca male i redirect."""
+    if "vm.tiktok.com" not in url and "vt.tiktok.com" not in url:
+        return url
+    try:
+        r = requests.get(url, headers=TIKWM_HEADERS, timeout=10, allow_redirects=True)
+        return r.url
+    except Exception:
+        return url  # se la risoluzione fallisce, proviamo comunque con l'originale
+
+
 def extract_tiktok(url: str) -> dict:
+    url = _resolve_short_url(url)
     try:
         r = requests.get(TIKWM_ENDPOINT, params={"url": url}, headers=TIKWM_HEADERS, timeout=20)
         r.raise_for_status()
@@ -152,6 +166,31 @@ def extract_instagram(url: str) -> dict:
 
     post_type = "carousel" if len(media) > 1 else media[0]["type"]
     return {"platform": "instagram", "type": post_type, "media": media}
+
+
+@app.route("/debug-tiktok")
+def debug_tiktok():
+    """Endpoint temporaneo: mostra la risoluzione del link corto e la risposta grezza di tikwm."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "parametro 'url' mancante"}), 400
+
+    result = {"original_url": url}
+    resolved = _resolve_short_url(url)
+    result["resolved_url"] = resolved
+
+    try:
+        r = requests.get(TIKWM_ENDPOINT, params={"url": resolved}, headers=TIKWM_HEADERS, timeout=20)
+        result["status_code"] = r.status_code
+        result["response_headers"] = dict(r.headers)
+        try:
+            result["response_body"] = r.json()
+        except Exception:
+            result["response_body_text"] = r.text[:500]
+    except Exception as e:
+        result["request_exception"] = str(e)
+
+    return jsonify(result)
 
 
 @app.route("/debug-extract")
@@ -227,6 +266,34 @@ def proxy():
 
     content_type = r.headers.get("Content-Type", "application/octet-stream")
     return Response(r.content, content_type=content_type)
+
+
+@app.route("/extract-simple")
+def extract_simple():
+    """Versione semplificata di /extract per Comandi Rapidi: invece di un
+    oggetto con "media": [{"type":..., "url":...}], restituisce DIRETTAMENTE
+    un elenco piatto di link pronti da scaricare (solo stringhe). Questo
+    evita che lo Shortcut debba estrarre chiavi da dizionari annidati dentro
+    il ciclo, che è il punto dove si creano più errori di collegamento."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "parametro 'url' mancante"}), 400
+
+    try:
+        if "tiktok.com" in url:
+            result = extract_tiktok(url)
+        elif "instagram.com" in url:
+            result = extract_instagram(url)
+        else:
+            return jsonify({"error": "piattaforma non supportata (solo Instagram/TikTok)"}), 400
+
+        links = [
+            f"{request.host_url}proxy?url={quote(item['url'], safe='')}"
+            for item in result.get("media", [])
+        ]
+        return jsonify(links)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/extract")
