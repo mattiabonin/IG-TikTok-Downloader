@@ -108,28 +108,31 @@ def _resolve_short_url(url: str) -> str:
 def _extract_tiktok_via_ytdlp(url: str) -> dict:
     """Fallback quando tikwm è bloccato: usa yt-dlp per contattare
     direttamente TikTok. Funziona solo per video singoli, NON per
-    caroselli fotografici (limite noto di yt-dlp su TikTok)."""
+    caroselli fotografici (yt-dlp non supporta affatto le URL /photo/ di TikTok)."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    if info.get("_type") == "playlist":
-        # Caroselli/slideshow: yt-dlp non li gestisce bene su TikTok
+        if info.get("_type") == "playlist":
+            raise ValueError("caroselli non supportati")
+
+        direct_url = info.get("url")
+        if not direct_url and info.get("formats"):
+            direct_url = info["formats"][-1].get("url")
+        if not direct_url:
+            raise ValueError("nessun video trovato")
+    except Exception:
         raise ValueError(
-            "Il servizio principale (tikwm) è momentaneamente bloccato e il "
-            "sistema di riserva non supporta i caroselli fotografici TikTok, "
-            "solo i video singoli. Riprova più tardi."
+            "Il servizio principale (tikwm) è momentaneamente bloccato. Se questo "
+            "è un carosello di foto TikTok, al momento non è scaricabile: il "
+            "sistema di riserva supporta solo i video singoli. Riprova più tardi, "
+            "il blocco su tikwm è spesso temporaneo."
         )
-
-    direct_url = info.get("url")
-    if not direct_url and info.get("formats"):
-        direct_url = info["formats"][-1].get("url")
-    if not direct_url:
-        raise ValueError("Nessun video estraibile con il sistema di riserva")
 
     return {"platform": "tiktok", "type": "video", "media": [{"type": "video", "url": direct_url}]}
 
@@ -338,11 +341,14 @@ def extract():
         else:
             return jsonify({"error": "piattaforma non supportata (solo Instagram/TikTok)"}), 400
 
-        # Riscriviamo ogni link per passare dal nostro /proxy invece che dal
-        # CDN diretto, così chi scarica (es. Shortcuts) ottiene sempre i byte
-        # corretti indipendentemente da header/cookie che non può impostare.
-        for item in result.get("media", []):
-            item["url"] = f"{request.host_url}proxy?url={quote(item['url'], safe='')}"
+        # Il /proxy serve per Instagram (serve la sessione autenticata per
+        # ottenere i byte corretti). I link TikTok, specialmente quelli
+        # firmati direttamente dai server ufficiali (quando usiamo yt-dlp
+        # come riserva), sono legati a header/contesto specifici e si rompono
+        # se passano da un proxy con header generici: li lasciamo diretti.
+        if result.get("platform") == "instagram":
+            for item in result.get("media", []):
+                item["url"] = f"{request.host_url}proxy?url={quote(item['url'], safe='')}"
 
         return jsonify(result)
     except Exception as e:
